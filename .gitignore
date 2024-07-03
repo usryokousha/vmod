@@ -1,1 +1,6 @@
 venv/
+.python-version
+scrape_files.py
+.vscode/launch.json
+.vscode/settings.json
+*.pyc
