@@ -1,93 +1,89 @@
+# MoE implementation based on the one in Flaxformer:
+# https://github.com/google/flaxformer/blob/main/flaxformer/architectures/moe/moe_layers.py
+# A PyTorch implementation supporting Expert Choice and Token Choice routing does not seem to exist.
+# This implementation attempts to provide similar functionality to the Flaxformer implementation
+# while also taking into account PyTorch's distributed data parallelism features.
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, Union
-from dataclasses import dataclass
 
-from routing import ExpertsChooseMaskedRouter, MaskedRouter, RouterMask
+import torch.distributed as dist
+
+from vmod import routing
+
+from typing import Optional, Tuple, Any
+
+
+# Based on https://github.com/pytorch/pytorch/pull/40762
+class _AllToAll(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx: Any, group: dist.ProcessGroup, input: Tensor) -> Tensor:  # type: ignore
+        ctx.group = group
+        input = input.contiguous()
+        output = torch.empty_like(input)
+        dist.all_to_all_single(output, input, group=group)
+        return output
+
+    @staticmethod
+    def backward(ctx: Any, *grad_output: torch.Tensor) -> Tuple[None, torch.Tensor]:
+        return (None, _AllToAll.apply(ctx.group, *grad_output))
+
 
 class MoeLayer(nn.Module):
     def __init__(
         self,
-        num_experts: int,
-        max_group_size: int,
-        train_capacity_factor: float,
-        eval_capacity_factor: float,
-        expert: Union[nn.Module, nn.Linear],
-        router: MaskedRouter,
-        num_expert_partitions: int,
-        num_model_partitions: int,
+        router: routing.Router,
+        experts: nn.ModuleList,
+        train_capacity_factor: float = 1.0,
+        eval_capacity_factor: float = 1.0,
         min_expert_capacity: int = 4,
-        dropout_rate: float = 0.1,
-        dtype: torch.dtype = torch.bfloat16,
-        split_params: bool = True,
-        strict_group_size: bool = False,
+        group: Optional[dist.ProcessGroup] = None,
     ):
         super().__init__()
-        self.num_experts = num_experts
-        self.max_group_size = max_group_size
+        self.router = router
+        self.experts = experts
         self.train_capacity_factor = train_capacity_factor
         self.eval_capacity_factor = eval_capacity_factor
-        self.expert = expert
-        self.router = router
-        self.num_expert_partitions = num_expert_partitions
-        self.num_model_partitions = num_model_partitions
         self.min_expert_capacity = min_expert_capacity
-        self.dropout_rate = dropout_rate
-        self.dtype = dtype
-        self.split_params = split_params
-        self.strict_group_size = strict_group_size
+        self.experts = experts
+        self.group = group if group is not None else dist.group.WORLD
 
-        if self.num_expert_partitions > self.num_experts:
-            raise ValueError(
-                f'The number of expert partitions ({self.num_expert_partitions}) '
-                f'cannot be greater than the number of experts ({self.num_experts}).'
-            )
+        # Set expert flag for all parameters
+        for expert in self.experts:
+            for p in expert.parameters():
+                p.expert = True
+        self.num_groups = dist.get_world_size(group=self.group)
+        self.num_local_experts = len(self.experts)
 
-        self.num_expert_replicas = self._num_expert_replicas(
-            self.num_expert_partitions, self.num_model_partitions
-        )
+    def _call_experts(self, inputs: torch.Tensor) -> torch.Tensor:
+        num_groups, num_experts, capacity, *hidden_dims = inputs.shape
 
-    def forward(
-        self,
-        inputs: torch.Tensor,
-        enable_dropout: bool = True,
-    ) -> torch.Tensor:
-        original_batch_size, original_seq_length, *hidden_dims = inputs.shape
+        # All-to-all communication
+        inputs = _AllToAll.apply(self.group, inputs)
 
-        padded_inputs = self._maybe_pad(inputs, self.num_experts, self.num_expert_replicas)
-        padded_batch_size, padded_seq_length, *_ = padded_inputs.shape
+        # Reshape for expert computation
+        inputs = inputs.reshape(num_experts, -1, *hidden_dims)
 
-        num_tokens = padded_batch_size * padded_seq_length
+        # Apply expert transformation
+        chunks = torch.chunk(inputs, self.num_local_experts, dim=0)
+        outputs = []
+        for expert, chunk in zip(self.experts, chunks):
 
-        num_groups = self._num_groups(
-            num_tokens,
-            self.max_group_size,
-            self.num_experts,
-            self.num_expert_replicas,
-            self.strict_group_size,
-        )
-        tokens_per_group = num_tokens // num_groups
+            if isinstance(self.experts, nn.Module):
+                outputs = self.experts(chunk)
+            else:
+                raise ValueError(f"Unsupported expert class: {type(self.experts)}")
+            outputs += [expert(chunk)]
+        output = torch.cat(outputs, dim=0)
 
-        capacity_factor = self.train_capacity_factor if enable_dropout else self.eval_capacity_factor
-        expert_capacity = max(int(round(capacity_factor * tokens_per_group / self.num_experts)), self.min_expert_capacity)
+        # All-to-all communication
+        output = _AllToAll.apply(self.group, output)
 
-        grouped_inputs = padded_inputs.reshape(num_groups, tokens_per_group, *hidden_dims)
+        # Reshape back to original shape
+        outputs = outputs.reshape(num_groups, num_experts, capacity, -1)
 
-        if isinstance(self.router, MaskedRouter):  # Assuming this is a MaskedRouter
-            outputs = self._mask_and_dispatch_to_experts(
-                grouped_inputs,
-                enable_dropout,
-                expert_capacity,
-            )
-        else:
-            raise ValueError(f'Unrecognized router type: {self.router}')
-
-        result = outputs.reshape(padded_batch_size, padded_seq_length, *outputs.shape[2:])
-        if padded_seq_length - original_seq_length > 0 or padded_batch_size - original_batch_size > 0:
-            result = result[:original_batch_size, :original_seq_length]
-
-        return result
+        return outputs
 
     def _mask_and_dispatch_to_experts(
         self,
@@ -97,15 +93,15 @@ class MoeLayer(nn.Module):
     ) -> torch.Tensor:
         num_groups, tokens_per_group = token_inputs.shape[:2]
 
-        router_mask: RouterMask = self.router(
+        router_mask: routing.RouterMask = self.router(
             token_inputs,
-            self.num_experts,
+            self.num_local_experts,
             expert_capacity,
             apply_jitter=enable_dropout,
         )
 
         expert_inputs = torch.einsum(
-            'gt...,gtec->gec...',
+            "gt...,gtec->gec...",
             token_inputs,
             router_mask.dispatch_mask,
         )
@@ -113,7 +109,7 @@ class MoeLayer(nn.Module):
         expert_outputs = self._call_experts(expert_inputs, enable_dropout)
 
         combined_outputs = torch.einsum(
-            'gec...,gtec->gt...',
+            "gec...,gtec->gt...",
             expert_outputs,
             router_mask.combine_array,
         )
@@ -132,118 +128,84 @@ class MoeLayer(nn.Module):
         num_tokens_dispatched = router_mask.dispatch_mask.sum()
         router_confidence = router_mask.combine_array.sum() / num_tokens_dispatched
 
-        if isinstance(self.router, ExpertsChooseMaskedRouter):
+        if isinstance(self.router, routing.ExpertsChooseMaskedRouter):
             expert_usage = 1.0
         else:
             total_expert_capacity = self.num_experts * expert_capacity * num_groups
             expert_usage = num_tokens_dispatched / total_expert_capacity
 
-        self._sow_expert_metrics(
-            router_mask.auxiliary_loss,
-            router_mask.router_z_loss,
-            fraction_tokens_left_behind,
-            router_confidence,
-            expert_usage,
+        metrics = {
+            "auxiliary_loss": router_mask.auxiliary_loss,
+            "router_z_loss": router_mask.router_z_loss,
+            "fraction_tokens_left_behind": fraction_tokens_left_behind,
+            "router_confidence": router_confidence,
+            "expert_usage": expert_usage,
+        }
+
+        return combined_outputs, metrics
+
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        enable_dropout: bool = True,
+    ) -> torch.Tensor:
+        original_batch_size, original_seq_length, *hidden_dims = inputs.shape
+
+        padded_inputs = self._maybe_pad(inputs, self.num_local_experts, self.num_groups)
+        padded_batch_size, padded_seq_length, *_ = padded_inputs.shape
+
+        num_tokens = padded_batch_size * padded_seq_length
+        tokens_per_group = num_tokens // self.num_groups
+
+        capacity_factor = (
+            self.train_capacity_factor if enable_dropout else self.eval_capacity_factor
+        )
+        expert_capacity = max(
+            int(round(capacity_factor * tokens_per_group / self.num_local_experts)),
+            self.min_expert_capacity,
         )
 
-        return combined_outputs
+        grouped_inputs = padded_inputs.reshape(
+            self.num_groups, tokens_per_group, *hidden_dims
+        )
 
-    def _call_experts(self, inputs: torch.Tensor, enable_dropout: bool) -> torch.Tensor:
-        num_groups, num_experts, capacity, *hidden_dims = inputs.shape
-        inputs = inputs.to(self.dtype)
-
-        # Reshape for expert computation
-        inputs = inputs.reshape(num_experts, -1, *hidden_dims)
-
-        # Apply expert transformation
-        if isinstance(self.expert, nn.Linear):
-            outputs = self.expert(inputs)
-        elif isinstance(self.expert, nn.Module):  # Assuming this is an MLP
-            outputs = self.expert(inputs, enable_dropout=enable_dropout)
+        if isinstance(
+            self.router, routing.MaskedRouter
+        ):  # Assuming this is a MaskedRouter
+            outputs = self._mask_and_dispatch_to_experts(
+                grouped_inputs,
+                enable_dropout,
+                expert_capacity,
+            )
         else:
-            raise ValueError(f'Unsupported expert class: {type(self.expert)}')
+            raise ValueError(f"Unrecognized router type: {self.router}")
 
-        # Reshape back to original shape
-        outputs = outputs.reshape(num_groups, num_experts, capacity, -1)
+        result = outputs.reshape(
+            padded_batch_size, padded_seq_length, *outputs.shape[2:]
+        )
+        if (
+            padded_seq_length - original_seq_length > 0
+            or padded_batch_size - original_batch_size > 0
+        ):
+            result = result[:original_batch_size, :original_seq_length]
 
-        return outputs
-
-    def _sow_expert_metrics(
-        self,
-        auxiliary_loss: float,
-        router_z_loss: float,
-        fraction_tokens_left_behind: float,
-        router_confidence: float,
-        expert_usage: float,
-    ) -> None:
-        # In PyTorch, we'll use a dictionary to store these metrics
-        metrics = {
-            'auxiliary_loss': auxiliary_loss,
-            'router_z_loss': router_z_loss,
-            'fraction_tokens_left_behind': fraction_tokens_left_behind,
-            'router_confidence': router_confidence,
-            'expert_usage': expert_usage,
-        }
-        self.last_metrics = metrics  # Store the metrics as an attribute
+        return result
 
     @staticmethod
-    def _num_groups(
-        num_tokens: int,
-        max_group_size: int,
-        num_experts: int,
-        num_expert_replicas: int = 1,
-        strict_group_size: bool = False,
-    ) -> int:
-        min_num_groups = num_tokens // max_group_size
-        min_num_groups = max(min_num_groups, num_expert_replicas * num_experts)
-
-        def viable(n):
-            return num_tokens % n == 0 and n % (num_expert_replicas * num_experts) == 0
-
-        num_groups = min_num_groups
-        while num_groups < num_tokens and not viable(num_groups):
-            num_groups += 1
-
-        if num_tokens % num_groups > 0:
-            raise ValueError(
-                'Group size and the number of experts must divide evenly into the '
-                f'global number of tokens, but num_tokens={num_tokens}, while '
-                f'num_groups={num_groups} for max_group_size={max_group_size} '
-                f'and num_experts={num_experts}, each with {num_expert_replicas} '
-                'replicas.'
-            )
-
-        group_size = num_tokens // num_groups
-
-        if strict_group_size and group_size != max_group_size:
-            raise ValueError(
-                f'Selected group_size={group_size} is less than the '
-                f'max_group_size={max_group_size}. Exiting because strict mode is '
-                'active (strict_group_size=True)'
-            )
-
-        return num_groups
-
-    @staticmethod
-    def _num_expert_replicas(num_expert_partitions: int, num_model_partitions: int) -> int:
-        raise NotImplementedError
-
-    @staticmethod
-    def _maybe_pad(inputs: torch.Tensor, num_experts: int, num_expert_replicas: int = 1) -> torch.Tensor:
+    def _maybe_pad(inputs: torch.Tensor, num_groups: int) -> torch.Tensor:
         batch_size, seq_length, *_ = inputs.shape
         num_tokens = batch_size * seq_length
-        total_num_experts = num_expert_replicas * num_experts
 
-        if num_tokens % total_num_experts != 0:
+        if num_tokens % num_groups != 0:
             min_batch_padding = 1
             num_padding_tokens = seq_length
-            while (num_tokens + num_padding_tokens) % total_num_experts != 0:
+            while (num_tokens + num_padding_tokens) % num_groups != 0:
                 min_batch_padding += 1
                 num_padding_tokens += seq_length
 
             min_seq_padding = 1
             num_padding_tokens = batch_size
-            while (num_tokens + num_padding_tokens) % total_num_experts != 0:
+            while (num_tokens + num_padding_tokens) % num_groups != 0:
                 min_seq_padding += 1
                 num_padding_tokens += batch_size
 
@@ -255,7 +217,7 @@ class MoeLayer(nn.Module):
             result = F.pad(
                 inputs,
                 (0, 0, 0, min_seq_padding, 0, min_batch_padding),
-                'constant',
+                "constant",
                 0,
             )
 
