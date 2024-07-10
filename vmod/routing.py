@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, Any
+from typing import Optional, Tuple, Any, Union
 from dataclasses import dataclass, replace
 
 
@@ -119,7 +119,6 @@ class Router(nn.Module):
         raise NotImplementedError(
             "Router is an abstract class that should be subclassed."
         )
-
 
 class MaskedRouter(Router):
     """Abstract base router class for masked matmul dispatch routers.
@@ -247,91 +246,6 @@ class ExpertsChooseMaskedRouter(Router):
         return F.binary_cross_entropy(
             router_probs, dispatch_mask.any(dim=-1).float(), reduction="mean"
         )
-
-
-class VariableCapacityExpertsChooseMaskedRouter(ExpertsChooseMaskedRouter):
-    """
-    Masked matmul router using experts choose tokens assignment with variable capacities.
-
-    This router allows specifying different capacity factors for each expert.
-    """
-
-    def __init__(
-        self,
-        router_weights: nn.Linear,
-        jitter_noise: float,
-        dtype: torch.dtype,
-        ignore_padding_tokens: bool,
-        capacity_factors: Tuple[float, ...],
-        auxiliary_loss: bool = False,
-    ):
-        super().__init__(
-            router_weights, jitter_noise, dtype, ignore_padding_tokens, auxiliary_loss
-        )
-        self.capacity_factors = capacity_factors
-        assert (
-            len(capacity_factors) == router_weights.out_features
-        ), "Number of capacity factors must match number of experts"
-        assert sum(capacity_factors) == 1.0, "Capacity factors must sum to 1.0"
-
-    def _compute_routing_instructions(
-        self,
-        router_probs: torch.Tensor,
-        padding_mask: Optional[torch.Tensor],
-        expert_capacity: int,
-    ) -> RouterMask:
-        num_groups, tokens_per_group, num_experts = router_probs.shape
-
-        if padding_mask is not None:
-            router_probs *= padding_mask.unsqueeze(-1)
-
-        router_probs_t = router_probs.transpose(1, 2)
-
-        # Calculate individual expert capacities
-        expert_capacities = [
-            max(1, int(factor * expert_capacity)) for factor in self.capacity_factors
-        ]
-
-        # Initialize tensors to store results
-        dispatch_mask = torch.zeros(
-            num_groups,
-            tokens_per_group,
-            num_experts,
-            expert_capacity,
-            dtype=torch.int32,
-            device=router_probs.device,
-        )
-        combine_array = torch.zeros(
-            num_groups,
-            tokens_per_group,
-            num_experts,
-            expert_capacity,
-            dtype=router_probs.dtype,
-            device=router_probs.device,
-        )
-
-        # Perform top-k for each expert separately
-        for i, capacity in enumerate(expert_capacities):
-            expert_gate, expert_index = torch.topk(
-                router_probs_t[:, i], k=capacity, dim=-1
-            )
-
-            # Create dispatch mask for this expert
-            dispatch_mask[:, :, i, :capacity] = F.one_hot(
-                expert_index, num_classes=tokens_per_group
-            ).permute(0, 2, 1)
-
-            # Create combine array for this expert
-            combine_array[:, :, i, :capacity] = expert_gate.unsqueeze(
-                1
-            ) * dispatch_mask[:, :, i, :capacity].to(router_probs.dtype)
-
-        auxiliary_loss = 0.0
-        if self.auxiliary_loss:
-            auxiliary_loss = self._auxiliary_loss(router_probs, dispatch_mask)
-
-        return RouterMask(dispatch_mask, combine_array, auxiliary_loss)
-
 
 class TokensChooseMaskedRouter(MaskedRouter):
     """
