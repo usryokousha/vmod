@@ -28,6 +28,9 @@ class _AllToAll(torch.autograd.Function):
     @staticmethod
     def backward(ctx: Any, *grad_output: torch.Tensor) -> Tuple[None, torch.Tensor]:
         return (None, _AllToAll.apply(ctx.group, *grad_output))
+    
+def all_to_all(group: dist.ProcessGroup, input: torch.Tensor) -> torch.Tensor:
+    return _AllToAll.apply(group, input)
 
 
 class MoeLayer(nn.Module):
